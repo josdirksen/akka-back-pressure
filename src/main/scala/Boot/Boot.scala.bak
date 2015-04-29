@@ -1,0 +1,161 @@
+package Boot
+
+import akka.stream.actor.ActorSubscriberMessage.{OnComplete, OnNext}
+import akka.stream.actor.{OneByOneRequestStrategy, RequestStrategy, ActorSubscriber}
+import akka.stream.scaladsl.Broadcast
+import akka.stream.scaladsl._
+import akka.actor.{Props, ActorSystem}
+import akka.stream.{UniformFanOutShape, UniformFanInShape, OverflowStrategy, ActorFlowMaterializer}
+import org.akkamon.core.exporters.StatsdExporter
+import org.akkamon.core.instruments.{CounterTrait, TimingTrait, LoggingTrait}
+
+import scala.concurrent.duration._
+
+case class Tick()
+
+/**
+ * Scenarios to show in an article:
+ *
+ *  1. Fast publisher, Faster consumer
+ *    - publisher with a map to send, and a throttler (e.g 50 msg/s)
+ *    - Result: publisher and consumer rates should be equal.
+ *
+ *  2. Fast publisher, fast consumer in the beginning get slower, no buffer
+ *    - same publisher as step 1. (e.g 50msg/s)
+ *    - consumer, which gets slower (starts at no delay, increase delay with every message.
+ *    - Result: publisher and consumer will start at same rate. Publish rate will go down
+ *              together with publisher rate.
+ *
+ *  3. Fast publisher, fast consumer in the beginning get slower, with drop buffer
+ *    - same publisher as step 1. (e.g 50msg/s)
+ *    - consumer, which gets slower (starts at no delay, increase delay with every message.
+ *    - Result: publisher stays at the same rate, consumer starts dropping messages
+ *
+ *  4. Fast publisher, 2 fast consumers, one consumer which gets slower
+ *    - Result: publisher rate and all consumer rates go down at the same time
+ *
+ *  5. Fast publisher, 2 fast consumers, one consumer which gets slower but has buffer with drop
+ *    - Result: publisher rate and fast consumer rates stay the same. Slow consumer goes down.
+ *
+ *  6. Fast publisher (50msg/s), 2 consumer which total 70msg/s, one gets slower with balancer
+ *    - Result: slowly more will be processed by fast one. When fast one can't keep up, publisher
+ *              will slow down*
+ */
+object Boot extends App {
+
+  implicit val system = ActorSystem("Sys")
+  import system.dispatcher
+  implicit val materializer = ActorFlowMaterializer()
+
+  // max 20 messages per second
+  val tickSource = Source(1 second, 25 milliseconds, Tick())
+
+  // random speed source.
+  val source = Source(1 to 5000).map((x) => {Thread.sleep(Math.random()*200 toLong);x})
+  val normalSink = Sink.fold[Int, Int](0)((x,y) => {
+    println(s"In fast sink:  $y")
+    Thread.sleep(10)
+    x + y
+  })
+
+
+
+
+  val actorSink1 = Sink(Props(classOf[Sub], "name1"));
+  val actorSink2 = Sink(Props(classOf[Sub], "name2"));
+  val actorSink3 = Sink(Props(classOf[Sub], "name3"));
+
+  val slowSink = Sink.foreach[Int] { x =>
+    println(s"In slow sink: $x")
+    Thread.sleep(50)
+  }
+
+  // create a throttled source
+  val throttledSource = Source() { implicit b =>
+    import FlowGraph.Implicits._
+
+    val tickSource = Source(1 second, 25 milliseconds, Tick())
+    val rangeSource = Source(1 to 5000)
+    val sendMap = Flow[Int].map((x) => {StatsdExporter.processCounter("Publisher"); x})
+    val zip = b.add(Zip[Tick, Int]())
+
+    tickSource ~> zip.in0
+    rangeSource ~> sendMap ~> zip.in1
+
+    zip.out
+  }
+
+  val slowBuffer = Flow[Int].buffer(2, OverflowStrategy.dropHead)
+
+  FlowGraph.closed() { implicit builder =>
+
+      import FlowGraph.Implicits._
+
+      // create the three graph elements, we'll use
+      val broadcast = builder.add(Broadcast[Int](3)) // the splitter - like a Unix tee
+      val zip = builder.add(Zip[Tick, Int]())
+      val map = Flow[(Tick, Int)].map(_._2)
+
+      val slowMap = Flow[Int].map((x) => {Thread.sleep(Math.random() * 250 toLong); x})
+      val sendMap = Flow[Int].map((x) => {StatsdExporter.processCounter("Publisher"); x})
+
+      // connect the two sources to the zip inlets
+      tickSource ~> zip.in0
+          source ~> sendMap ~> zip.in1
+
+      // connect the zip outlet to the broadcasts
+      zip.out ~> map ~> broadcast ~> actorSink2
+                        broadcast ~> slowBuffer ~> slowMap ~> actorSink3
+                        broadcast ~> slowBuffer ~> slowMap ~> actorSink1
+  }.run()
+
+//  mat1.onSuccess({case success => println(s"Slow Success: $success")})
+//  mat1.onFailure({case fail => println(s"Slow Failure: $fail")})
+//
+//  mat2.onSuccess({case success => println(s"Fast Success: $success")})
+//  mat2.onFailure({case fail => println(s"Fast Failure: $fail")})
+
+  /**
+   *  1. Fast publisher, Faster consumer
+   *    - publisher with a map to send, and a throttler (e.g 50 msg/s)
+   *    - Result: publisher and consumer rates should be equal.
+   */
+  def setupScenario1(): Unit = {
+    FlowGraph.closed() { implicit builder =>
+
+      import FlowGraph.Implicits._
+
+      // create the three graph elements, we'll use
+      val broadcast = builder.add(Broadcast[Int](3)) // the splitter - like a Unix tee
+      val zip = builder.add(Zip[Tick, Int]())
+      val map = Flow[(Tick, Int)].map(_._2)
+
+      val slowMap = Flow[Int].map((x) => {Thread.sleep(Math.random() * 250 toLong); x})
+      val sendMap = Flow[Int].map((x) => {StatsdExporter.processCounter("Publisher"); x})
+
+      // connect the two sources to the zip inlets
+             tickSource ~> zip.in0
+      source ~> sendMap ~> zip.in1
+
+      // connect the zip outlet to the broadcasts
+      zip.out ~> map ~> broadcast ~> actorSink2
+      broadcast ~> slowBuffer ~> slowMap ~> actorSink3
+      broadcast ~> slowBuffer ~> slowMap ~> actorSink1
+    }
+  }
+
+}
+
+
+
+class Sub(name: String) extends ActorSubscriber with LoggingTrait with TimingTrait with CounterTrait {
+  override protected def requestStrategy: RequestStrategy = OneByOneRequestStrategy
+
+  actorName = name
+
+  override def receive: Receive = {
+    case OnNext(msg) => println(s"In actor sink $actorName: $msg")
+    case OnComplete => println(s"Completed")
+  }
+}
+
