@@ -11,9 +11,9 @@ object Util {
     val json: JsValue = Json.arr(
       Json.obj(
         "name" -> serieName,
-        "columns" -> Json.arr("time","value"),
-        "points" -> values.map {case (ts, value) => Json.arr(ts, value)}
-    ))
+        "columns" -> Json.arr("time", "value"),
+        "points" -> values.map { case (ts, value) => Json.arr(ts, value) }
+      ))
 
     Json.prettyPrint(json)
   }
